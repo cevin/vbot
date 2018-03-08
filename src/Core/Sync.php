@@ -3,114 +3,98 @@
  * Created by PhpStorm.
  * User: HanSon
  * Date: 2017/1/14
- * Time: 11:21
+ * Time: 11:21.
  */
 
 namespace Hanson\Vbot\Core;
 
-
-use Hanson\Vbot\Support\Console;
+use Hanson\Vbot\Exceptions\WebSyncException;
+use Hanson\Vbot\Foundation\Vbot;
 
 class Sync
 {
+    /**
+     * @var Vbot
+     */
+    private $vbot;
+
+    public function __construct(Vbot $vbot)
+    {
+        $this->vbot = $vbot;
+    }
 
     /**
-     * get a message code
+     * check if got a new message.
      *
-     * @return array
+     * @return array|bool
      */
     public function checkSync()
     {
-        $url = 'https://webpush.' . server()->domain . '/cgi-bin/mmwebwx-bin/synccheck?' . http_build_query([
-                'r' => time(),
-                'sid' => server()->sid,
-                'uin' => server()->uin,
-                'skey' => server()->skey,
-                'deviceid' => server()->deviceId,
-                'synckey' => server()->syncKeyStr,
-                '_' => time()
-            ]);
+        $content = $this->vbot->http->get($this->vbot->config['server.uri.push'].'/synccheck', ['timeout' => 35, 'query' => [
+            'r'        => time(),
+            'sid'      => $this->vbot->config['server.sid'],
+            'uin'      => $this->vbot->config['server.uin'],
+            'skey'     => $this->vbot->config['server.skey'],
+            'deviceid' => $this->vbot->config['server.deviceId'],
+            'synckey'  => $this->vbot->config['server.syncKeyStr'],
+            '_'        => time(),
+        ]]);
 
-        $content = http()->get($url);
+        if (!$content) {
+            $this->vbot->console->log('checkSync no response');
 
-        try{
-            preg_match('/window.synccheck=\{retcode:"(\d+)",selector:"(\d+)"\}/', $content, $matches);
-
-            return [$matches[1], $matches[2]];
-        }catch (\Exception $e){
-            Console::log('Sync check return:' . $content);
-            return [-1, -1];
+            return false;
         }
-    }
 
-    public function sync()
-    {
-        $url = sprintf(server()->baseUri . '/webwxsync?sid=%s&skey=%s&lang=en_US&pass_ticket=%s', server()->sid, server()->skey, server()->passTicket);
-
-        try{
-            $result = http()->json($url, [
-                'BaseRequest' => server()->baseRequest,
-                'SyncKey' => server()->syncKey,
-                'rr' => ~time()
-            ], true, ['timeout' => 35]);
-
-            if($result['BaseResponse']['Ret'] == 0){
-                $this->generateSyncKey($result);
-            }
-
-            return $result;
-        }catch (\Exception $e){
-            $this->sync();
-        }
+        return preg_match('/window.synccheck=\{retcode:"(\d+)",selector:"(\d+)"\}/', $content, $matches) ?
+            [$matches[1], $matches[2]] : false;
     }
 
     /**
-     * generate a sync key
+     * get a message.
+     *
+     * @throws WebSyncException
+     *
+     * @return mixed|string
+     */
+    public function sync()
+    {
+        $url = sprintf($this->vbot->config['server.uri.base'].'/webwxsync?sid=%s&skey=%s&lang=zh_CN&pass_ticket=%s',
+            $this->vbot->config['server.sid'],
+            $this->vbot->config['server.skey'],
+            $this->vbot->config['server.passTicket']
+        );
+
+        $result = $this->vbot->http->json($url, [
+            'BaseRequest' => $this->vbot->config['server.baseRequest'],
+            'SyncKey'     => $this->vbot->config['server.syncKey'],
+            'rr'          => ~time(),
+        ], true);
+
+        if ($result && $result['BaseResponse']['Ret'] == 0) {
+            $this->generateSyncKey($result);
+        }
+
+        return $result;
+    }
+
+    /**
+     * generate a sync key.
      *
      * @param $result
      */
     public function generateSyncKey($result)
     {
-        server()->syncKey = $result['SyncKey'];
+        $this->vbot->config['server.syncKey'] = $result['SyncKey'];
 
         $syncKey = [];
 
-        if(is_array(server()->syncKey['List'])){
-            foreach (server()->syncKey['List'] as $item) {
-                $syncKey[] = $item['Key'] . '_' . $item['Val'];
+        if (is_array($this->vbot->config['server.syncKey.List'])) {
+            foreach ($this->vbot->config['server.syncKey.List'] as $item) {
+                $syncKey[] = $item['Key'].'_'.$item['Val'];
             }
         }
 
-        server()->syncKeyStr = implode('|', $syncKey);
-    }
-
-    /**
-     * check message time
-     *
-     * @param $time
-     */
-    public function checkTime($time)
-    {
-        $checkTime = time() - $time;
-
-        if($checkTime < 0.8){
-            sleep(1 - $checkTime);
-        }
-    }
-
-    /**
-     * debug while the sync
-     *
-     * @param $retCode
-     * @param $selector
-     * @param null $sleep
-     */
-    public function debugMessage($retCode, $selector, $sleep = null)
-    {
-        Console::log('retcode:' . $retCode . ' selector:' . $selector, Console::WARNING);
-
-        if($sleep){
-            sleep($sleep);
-        }
+        $this->vbot->config['server.syncKeyStr'] = implode('|', $syncKey);
     }
 }

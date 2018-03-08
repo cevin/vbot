@@ -3,157 +3,133 @@
  * Created by PhpStorm.
  * User: Hanson
  * Date: 2016/12/9
- * Time: 21:10
+ * Time: 21:10.
  */
 
 namespace Hanson\Vbot\Core;
 
-
-use Endroid\QrCode\QrCode;
-use Hanson\Vbot\Collections\ContactFactory;
-use Hanson\Vbot\Collections\Group;
-use Hanson\Vbot\Collections\Special;
-use Hanson\Vbot\Support\Console;
-use Hanson\Vbot\Support\FileManager;
-use Hanson\Vbot\Support\System;
+use Carbon\Carbon;
+use Hanson\Vbot\Console\Console;
+use Hanson\Vbot\Exceptions\FetchUuidException;
+use Hanson\Vbot\Exceptions\InitFailException;
+use Hanson\Vbot\Exceptions\LoginFailedException;
+use Hanson\Vbot\Exceptions\LoginTimeoutException;
+use Hanson\Vbot\Foundation\Vbot;
 
 class Server
 {
+    /**
+     * @var Vbot
+     */
+    protected $vbot;
 
-    static $instance;
-
-    protected $uuid;
-
-    protected $redirectUri;
-
-    public $skey;
-
-    public $sid;
-
-    public $uin;
-
-    public $passTicket;
-
-    public $deviceId;
-
-    public $baseRequest;
-
-    public $syncKey;
-
-    public $syncKeyStr;
-
-    public $config;
-
-    public $messageHandler;
-
-    protected $debug = false;
-
-    public $baseUri = 'https://wx2.qq.com/cgi-bin/mmwebwx-bin';
-
-    public $fileUri;
-
-    public $pushUri;
-
-    public $domain = 'wx2.qq.com';
-
-    public function __construct($config = [])
+    public function __construct(Vbot $vbot)
     {
-        $this->config = $config;
-
-        $this->config['debug'] = isset($this->config['debug']) ? $this->config['debug'] : false;
+        $this->vbot = $vbot;
     }
 
-    /**
-     * @param array $config
-     * @return Server
-     */
-    public static function getInstance($config = [])
+    public function serve()
     {
-        if(!static::$instance){
-            static::$instance = new Server($config);
+        if (!$this->tryLogin()) {
+            $this->cleanCookies();
+            $this->login();
         }
 
-        return static::$instance;
+        $this->init();
+
+        if ($this->vbot->config['swoole.status']) {
+            $this->vbot->swoole->run();
+        } else {
+            $this->vbot->messageHandler->listen();
+        }
     }
 
     /**
-     * start a wechat trip
+     * 尝试登录.
+     *
+     * @return bool
      */
-    public function run()
+    private function tryLogin(): bool
     {
-        $this->prepare();
-        $this->init();
-        Console::log('初始化成功');
+        if (is_file($this->vbot->config['cookie_file']) && $this->vbot->cache->has($this->vbot->config['session_key'])) {
+            $configs = json_decode($this->vbot->cache->get($this->vbot->config['session_key']), true);
 
-        $this->statusNotify();
-        Console::log('开始初始化联系人');
-        $this->initContact();
-        Console::log('初始化联系人成功');
-        Console::log(sprintf("群数量： %d", group()->count()));
-        Console::log(sprintf("联系人数量： %d", contact()->count()));
-        Console::log(sprintf("公众号数量： %d", official()->count()));
-        MessageHandler::getInstance()->listen();
+            $this->vbot->config['server'] = $configs;
+            $this->vbot->config['server.time'] = $this->vbot->config['server.time'] ?: Carbon::now()->toDateTimeString();
+
+            if (!($checkSync = $this->vbot->sync->checkSync())) {
+                return false;
+            }
+
+            $result = $this->vbot->messageHandler->handleCheckSync($checkSync[0], $checkSync[1], true);
+
+            if ($result) {
+                $this->vbot->reLoginSuccessObserver->trigger();
+
+                return true;
+            }
+        }
+        $this->vbot->config['server.time'] = Carbon::now()->toDateTimeString();
+
+        return false;
     }
 
-    public function prepare()
+    private function cleanCookies()
+    {
+        $this->vbot->console->log('cleaning useless cookies.');
+        if (is_file($this->vbot->config['cookie_file'])) {
+            unlink($this->vbot->config['cookie_file']);
+        }
+    }
+
+    /**
+     * login.
+     */
+    public function login()
     {
         $this->getUuid();
-        $this->generateQrCode();
-        Console::showQrCode('https://login.weixin.qq.com/l/' . $this->uuid);
-        Console::log('请扫描二维码登录');
-
+        $this->showQrCode();
         $this->waitForLogin();
-        $this->login();
-        Console::log('登录成功');
+        $this->getLogin();
     }
 
     /**
-     * get uuid
+     * get uuid.
      *
      * @throws \Exception
      */
     protected function getUuid()
     {
-        $content = http()->get('https://login.weixin.qq.com/jslogin', [
+        $content = $this->vbot->http->get('https://login.weixin.qq.com/jslogin', ['query' => [
             'appid' => 'wx782c26e4c19acffb',
-            'fun' => 'new',
-            'lang' => 'zh_CN',
-//            '_' => time() * 1000 . random_int(1, 999)
-            '_' => time()
-        ]);
+            'fun'   => 'new',
+            'lang'  => 'zh_CN',
+            '_'     => time(),
+        ]]);
 
         preg_match('/window.QRLogin.code = (\d+); window.QRLogin.uuid = \"(\S+?)\"/', $content, $matches);
 
-        if(!$matches){
-            Console::log('获取UUID失败', Console::ERROR);
-            exit;
+        if (!$matches) {
+            throw new FetchUuidException('fetch uuid failed.');
         }
 
-        $this->uuid = $matches[2];
+        $this->vbot->config['server.uuid'] = $matches[2];
     }
 
     /**
-     * generate a login qrcode
+     * show a login qrCode.
      */
-    public function generateQrCode()
+    public function showQrCode()
     {
-        $url = 'https://login.weixin.qq.com/l/' . $this->uuid;
+        $url = 'https://login.weixin.qq.com/l/'.$this->vbot->config['server.uuid'];
 
-        $qrCode = new QrCode($url);
+        $this->vbot->qrCodeObserver->trigger($url);
 
-        if(!is_dir(realpath($this->config['tmp']))){
-            mkdir($this->config['tmp'], 0700, true);
-        }
-
-        $file = System::getPath() . 'qr.png';
-
-        FileManager::download('qr.png', file_get_contents($url));
-
-        $qrCode->save($file);
+        $this->vbot->qrCode->show($url);
     }
 
     /**
-     * waiting user to login
+     * waiting user to login.
      *
      * @throws \Exception
      */
@@ -162,50 +138,36 @@ class Server
         $retryTime = 10;
         $tip = 1;
 
-        while($retryTime > 0){
-            $url = sprintf('https://login.weixin.qq.com/cgi-bin/mmwebwx-bin/login?tip=%s&uuid=%s&_=%s', $tip, $this->uuid, time());
+        $this->vbot->console->log('please scan the qrCode with wechat.');
+        while ($retryTime > 0) {
+            $url = sprintf('https://login.weixin.qq.com/cgi-bin/mmwebwx-bin/login?tip=%s&uuid=%s&_=%s', $tip, $this->vbot->config['server.uuid'], time());
 
-            $content = http()->get($url);
+            $content = $this->vbot->http->get($url, ['timeout' => 35]);
 
             preg_match('/window.code=(\d+);/', $content, $matches);
 
             $code = $matches[1];
-            switch($code){
+            switch ($code) {
                 case '201':
-                    Console::log('请点击确认登录微信');
+                    $this->vbot->console->log('please confirm login in wechat.');
                     $tip = 0;
                     break;
                 case '200':
-                    preg_match('/window.redirect_uri="(\S+?)";/', $content, $matches);
-                    $this->redirectUri = $matches[1] . '&fun=new';
-                    $domainList = [
-                        'wx2.qq.com' => ['file.wx2.qq.com', 'webpush.wx2.qq.com'],
-                        'wx8.qq.com' => ['file.wx8.qq.com', 'webpush.wx8.qq.com'],
-                        'wx.qq.com' => ['file.wx.qq.com', 'webpush.wx.qq.com'],
-                        'web2.wechat.com' => ['file.web2.wechat.com', 'webpushweb2.wechat.com'],
-                        'wechat.com' => ['file.web.wechat.com', 'webpushweb.web.wechat.com'],
-                    ];
+                    preg_match('/window.redirect_uri="(https:\/\/(\S+?)\/\S+?)";/', $content, $matches);
+
+                    $this->vbot->config['server.uri.redirect'] = $matches[1].'&fun=new';
                     $url = 'https://%s/cgi-bin/mmwebwx-bin';
-                    foreach ($domainList as $domain => $list) {
-                        if(str_contains($this->redirectUri, $domain)){
-                            $this->fileUri = sprintf($url, $list[0]);
-                            $this->pushUri = sprintf($url, $list[1]);
-                            $this->baseUri = sprintf($url, $domain);
-                            $this->domain = $domain;
-                            break;
-                        }else{
-                            $this->fileUri = $this->pushUri = $this->redirectUri;
-                        }
-                    }
+                    $this->vbot->config['server.uri.file'] = sprintf($url, 'file.'.$matches[2]);
+                    $this->vbot->config['server.uri.push'] = sprintf($url, 'webpush.'.$matches[2]);
+                    $this->vbot->config['server.uri.base'] = sprintf($url, $matches[2]);
+
                     return;
                 case '408':
-                    Console::log('登录超时，请重试', Console::WARNING);
                     $tip = 1;
                     $retryTime -= 1;
                     sleep(1);
                     break;
                 default:
-                    Console::log("登录失败，错误码：$code 。请重试", Console::ERROR);
                     $tip = 1;
                     $retryTime -= 1;
                     sleep(1);
@@ -213,135 +175,148 @@ class Server
             }
         }
 
-        Console::log('登录超时，退出应用', Console::ERROR);
-        exit;
+        $this->vbot->console->log('login time out!', Console::ERROR);
+
+        throw new LoginTimeoutException('Login time out.');
     }
 
     /**
-     * login wechat
-     * @return bool
+     * login wechat.
+     *
      * @throws \Exception
      */
-    public function login()
+    private function getLogin()
     {
-        $content = http()->get($this->redirectUri);
+        $content = $this->vbot->http->get($this->vbot->config['server.uri.redirect']);
 
-        $data = (array)simplexml_load_string($content, 'SimpleXMLElement', LIBXML_NOCDATA);
+        $data = (array) simplexml_load_string($content, 'SimpleXMLElement', LIBXML_NOCDATA);
 
-        $this->skey = $data['skey'];
-        $this->sid = $data['wxsid'];
-        $this->uin = $data['wxuin'];
-        $this->passTicket = $data['pass_ticket'];
+        $this->vbot->config['server.skey'] = $data['skey'];
+        $this->vbot->config['server.sid'] = $data['wxsid'];
+        $this->vbot->config['server.uin'] = $data['wxuin'];
+        $this->vbot->config['server.passTicket'] = $data['pass_ticket'];
 
-        if(in_array('', [$this->skey, $this->sid, $this->uin, $this->passTicket])){
-            Console::log('登录失败', Console::ERROR);
-            exit;
+        if (in_array('', [$data['wxsid'], $data['wxuin'], $data['pass_ticket']])) {
+            throw new LoginFailedException('Login failed.');
         }
 
-        $this->deviceId = 'e' .substr(mt_rand().mt_rand(), 1, 15);
+        $this->vbot->config['server.deviceId'] = 'e'.substr(mt_rand().mt_rand(), 1, 15);
 
-        $this->baseRequest = [
-            'Uin' => intval($this->uin),
-            'Sid' => $this->sid,
-            'Skey' => $this->skey,
-            'DeviceID' => $this->deviceId
+        $this->vbot->config['server.baseRequest'] = [
+            'Uin'      => $data['wxuin'],
+            'Sid'      => $data['wxsid'],
+            'Skey'     => $data['skey'],
+            'DeviceID' => $this->vbot->config['server.deviceId'],
         ];
 
-        return true;
+        $this->saveServer();
     }
 
+    /**
+     * store config to cache.
+     */
+    private function saveServer()
+    {
+        $this->vbot->cache->forever('session.'.$this->vbot->config['session'], json_encode($this->vbot->config['server']));
+    }
+
+    /**
+     * init.
+     *
+     * @param bool $first
+     *
+     * @throws InitFailException
+     */
     protected function init($first = true)
     {
-        $url = sprintf($this->baseUri . '/webwxinit?r=%d', time());
+        $this->beforeInitSuccess();
+        $url = $this->vbot->config['server.uri.base'].'/webwxinit?r='.time();
 
-        $content = http()->json($url, [
-            'BaseRequest' => $this->baseRequest
-        ]);
+        $result = $this->vbot->http->json($url, [
+            'BaseRequest' => $this->vbot->config['server.baseRequest'],
+        ], true);
 
-        $result = json_decode($content, true);
         $this->generateSyncKey($result, $first);
 
-        myself()->init($result['User']);
+        $this->vbot->myself->init($result['User']);
+
+        ApiExceptionHandler::handle($result, function ($result) {
+            $this->vbot->cache->forget('session.'.$this->vbot->config['session']);
+            $this->vbot->log->error('Init failed.'.json_encode($result));
+
+            throw new InitFailException('Init failed.');
+        });
+
+        $this->afterInitSuccess($result);
 
         $this->initContactList($result['ContactList']);
+        $this->initContact();
+    }
 
-        if($result['BaseResponse']['Ret'] != 0){
-            Console::log('初始化失败，链接：' . $url, Console::ERROR);
-            exit;
-        }
+    /**
+     * before init success.
+     */
+    private function beforeInitSuccess()
+    {
+        $this->vbot->console->log('current session: '.$this->vbot->config['session']);
+        $this->vbot->console->log('init begin.');
+    }
+
+    /**
+     * after init success.
+     *
+     * @param $content
+     */
+    private function afterInitSuccess($content)
+    {
+        $this->vbot->log->info('response:'.json_encode($content));
+        $this->vbot->console->log('init success.');
+        $this->vbot->loginSuccessObserver->trigger();
+        $this->vbot->console->log('init contacts begin.');
     }
 
     protected function initContactList($contactList)
     {
-        if($contactList){
-            foreach ($contactList as $contact) {
-                if(Group::isGroup($contact['UserName'])){
-                    group()->put($contact['UserName'], $contact);
-                }
-            }
+        if ($contactList) {
+            $this->vbot->contactFactory->store($contactList);
         }
     }
 
     protected function initContact()
     {
-        new ContactFactory();
+        $this->vbot->contactFactory->fetchAll();
     }
 
     /**
-     * open wechat status notify
+     * open wechat status notify.
      */
     protected function statusNotify()
     {
-        $url = sprintf($this->baseUri . '/webwxstatusnotify?lang=zh_CN&pass_ticket=%s', $this->passTicket);
+        $url = sprintf($this->vbot->config['server.uri.base'].'/webwxstatusnotify?lang=zh_CN&pass_ticket=%s', $this->vbot->config['server.passTicket']);
 
-        http()->json($url, [
-            'BaseRequest' => $this->baseRequest,
-            'Code' => 3,
-            'FromUserName' => myself()->username,
-            'ToUserName' => myself()->username,
-            'ClientMsgId' => time()
+        $this->vbot->http->json($url, [
+            'BaseRequest'  => $this->vbot->config['server.baseRequest'],
+            'Code'         => 3,
+            'FromUserName' => $this->vbot->myself->username,
+            'ToUserName'   => $this->vbot->myself->username,
+            'ClientMsgId'  => time(),
         ]);
     }
 
     protected function generateSyncKey($result, $first)
     {
-        $this->syncKey = $result['SyncKey'];
+        $this->vbot->config['server.syncKey'] = $result['SyncKey'];
 
         $syncKey = [];
 
-        if(is_array($this->syncKey['List'])){
-            foreach ($this->syncKey['List'] as $item) {
-                $syncKey[] = $item['Key'] . '_' . $item['Val'];
+        if (is_array($this->vbot->config['server.syncKey.List'])) {
+            foreach ($this->vbot->config['server.syncKey.List'] as $item) {
+                $syncKey[] = $item['Key'].'_'.$item['Val'];
             }
-        }elseif($first){
+        } elseif ($first) {
             $this->init(false);
         }
 
-        $this->syncKeyStr = implode('|', $syncKey);
-    }
-
-    public function setMessageHandler(\Closure $closure)
-    {
-        MessageHandler::getInstance()->setMessageHandler($closure);
-    }
-
-    public function setCustomerHandler(\Closure $closure)
-    {
-        MessageHandler::getInstance()->setCustomHandler($closure);
-    }
-
-    public function setExitHandler(\Closure $closure)
-    {
-        MessageHandler::getInstance()->setExitHandler($closure);
-    }
-
-    public function setExceptionHandler(\Closure $closure)
-    {
-        MessageHandler::getInstance()->setExceptionHandler($closure);
-    }
-
-    public function setOnceHandler(\Closure $closure)
-    {
-        MessageHandler::getInstance()->setOnceHandler($closure);
+        $this->vbot->config['server.syncKeyStr'] = implode('|', $syncKey);
     }
 }
